@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       company:
-        description: "Company name"
+        description: "Bedrijfsnaam"
         required: true
-        default: "Stichting Breda Actief"
       extra:
-        description: "Extra context, for example city or domain"
+        description: "Extra context zoals plaats of domein"
         required: false
-        default: "Breda"
+        default: ""
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -29,12 +29,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run SERP script
         run: |
-          python serp_linkedin_lists.py --company "${{ inputs.company }}" --extra "${{ inputs.extra }}" --max 10 > output.json
+          python serp_linkedin_lists.py \
+            --company "${{ inputs.company }}" \
+            --extra "${{ inputs.extra }}" \
+            --max 10 \
+            > output.json
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: serp-output
-          path: output.json
+      - name: Send result to n8n webhook
+        run: |
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            --data @output.json \
+            https://rbmedia.app.n8n.cloud/webhook/3c0d49a0-66bf-4a3c-a718-dc4f8d03669d
