@@ -70,26 +70,66 @@ def ddg_search(query: str, max_results: int = 10, timeout: int = 20) -> List[Ser
 
     return results
 
+def merge_dedupe(results_lists: list[list[SerpResult]], max_results: int = 10) -> list[SerpResult]:
+    seen = set()
+    merged: list[SerpResult] = []
 
-def build_queries(company: str, extra: Optional[str] = None) -> Dict[str, str]:
-    """
-    Three strategies:
-    1) Company page
-    2) People search with role keywords
-    3) Executive or leadership fallback
-    """
+    for lst in results_lists:
+        for r in lst:
+            u = (r.url or "").strip()
+            if not u:
+                continue
+            # Dedup op URL
+            if u in seen:
+                continue
+            seen.add(u)
+            merged.append(r)
+            if len(merged) >= max_results:
+                return merged
+
+    return merged
+
+
+def build_query_sets(company: str, extra: str | None = None) -> dict[str, list[str]]:
+    # extra is meestal stad, bv "Breda"
+    extra = (extra or "").strip()
     extra_part = f" {extra}" if extra else ""
 
-    q1 = f'site:linkedin.com/company "{company}"{extra_part}'
-    q2 = (
-        f'site:linkedin.com/in "{company}" (communicatie OR marketing OR online OR digital OR digitaal){extra_part}'
-    )
-    q3 = f'site:linkedin.com/in "{company}" (directeur OR manager OR bestuurder OR "raad van toezicht"){extra_part}'
+    # Maak ook een variant zonder streepjes in de naam, want die verschillen vaak
+    company_clean = company.replace("-", " ").strip()
+
+    # Zorg dat je ook zoekt op het domein als je die ooit meegeeft als extra
+    # Als extra geen domein is, is dit leeg en doet het niets.
+    domain_hint = extra if "." in extra else ""
+
+    people_broad = [
+        f'site:linkedin.com/in ("{company_clean}"){extra_part}',
+        f'site:linkedin.com/in ("{company}"){extra_part}',
+    ]
+
+    # Als je "Breda Actief" als losse term wilt forceren, voeg je die ook toe
+    # Handig bij stichtingen waar de officiële naam anders is.
+    people_broad.append(f'site:linkedin.com/in ("Breda Actief"){extra_part}')
+
+    if domain_hint:
+        people_broad.append(f"site:linkedin.com/in ({domain_hint})")
+
+    people_roles = [
+        f'site:linkedin.com/in ("Breda Actief") (communicatie OR marketing OR online){extra_part}',
+        f'site:linkedin.com/in ("Breda Actief") (website OR web OR digital OR digitaal){extra_part}',
+        f'site:linkedin.com/in ("{company_clean}") (communicatie OR marketing OR online){extra_part}',
+    ]
+
+    company_page = [
+        f'site:linkedin.com/company ("Breda Actief")',
+        f'site:linkedin.com/company ("{company_clean}")',
+        f'site:linkedin.com/company ("{company}")',
+    ]
 
     return {
-        "strategy_company_page": q1,
-        "strategy_people_roles": q2,
-        "strategy_leadership_fallback": q3,
+        "strategy_people_broad": people_broad,
+        "strategy_people_roles": people_roles,
+        "strategy_company_page": company_page,
     }
 
 
@@ -101,24 +141,26 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds (default 20)")
     args = parser.parse_args()
 
-    queries = build_queries(args.company, args.extra)
+    query_sets = build_query_sets(args.company, args.extra)
 
     output: Dict[str, object] = {
         "company": args.company,
         "extra": args.extra,
-        "queries": queries,
+        "queries": query_sets,
         "results": {},
     }
 
-    for key, q in queries.items():
-        try:
-            res = ddg_search(q, max_results=args.max, timeout=args.timeout)
-            output["results"][key] = [asdict(x) for x in res]
-        except Exception as e:
-            output["results"][key] = {
-                "error": str(e),
-                "items": [],
-            }
+    for strategy, queries in query_sets.items():
+        all_lists = []
+        for q in queries:
+            try:
+                all_lists.append(ddg_search(q, max_results=args.max, timeout=args.timeout))
+            except Exception:
+                all_lists.append([])
+
+        merged = merge_dedupe(all_lists, max_results=args.max)
+        output["results"][strategy] = [asdict(x) for x in merged]
+
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
