@@ -1,0 +1,40 @@
+name: linkedin-serp-lists
+
+on:
+  workflow_dispatch:
+    inputs:
+      company:
+        description: "Company name"
+        required: true
+        default: "Stichting Breda Actief"
+      extra:
+        description: "Extra context, for example city or domain"
+        required: false
+        default: "Breda"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run script
+        run: |
+          python serp_linkedin_lists.py --company "${{ inputs.company }}" --extra "${{ inputs.extra }}" --max 10 > output.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: serp-output
+          path: output.json
