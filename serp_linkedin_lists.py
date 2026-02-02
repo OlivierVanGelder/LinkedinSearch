@@ -78,7 +78,7 @@ def build_queries(company: str, extra: Optional[str] = None) -> Dict[str, str]:
     2) People search with role keywords
     3) Executive or leadership fallback
     """
-    extra_part = f' "{extra}"' if extra else ""
+    extra_part = f" {extra}" if extra else ""
 
     q1 = f'site:linkedin.com/company "{company}"{extra_part}'
     q2 = (
