@@ -43,3 +43,7 @@ jobs:
             -H "Content-Type: application/json" \
             --data @output.json \
             https://rbmedia.app.n8n.cloud/webhook/3c0d49a0-66bf-4a3c-a718-dc4f8d03669d
+
+      - name: Validate JSON
+        run: |
+          python -c "import json; json.load(open('output.json','r',encoding='utf-8')); print('json ok')"

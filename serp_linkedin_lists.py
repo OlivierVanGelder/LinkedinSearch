@@ -13,7 +13,7 @@ Geschikt voor GitHub Actions. Debug staat aan en print altijd:
 Gebruik:
   python serp_linkedin_lists.py --company "Stichting Breda-Actief" --extra "Breda" --max 10 > output.json
 """
-
+import sys
 import argparse
 import json
 import random
@@ -60,10 +60,11 @@ def ddg_search_lite(query: str, max_results: int = 10, timeout: int = 25, debug:
     resp.raise_for_status()
 
     if debug:
-        print("DDG status:", resp.status_code)
-        print("DDG length:", len(resp.text or ""))
-        print("DDG head (800):")
-        print((resp.text or "")[:800])
+        print("DDG status:", resp.status_code, file=sys.stderr)
+        print("DDG length:", len(resp.text or ""), file=sys.stderr)
+        print("DDG head (800):", file=sys.stderr)
+        print((resp.text or "")[:800], file=sys.stderr)
+
 
     html = resp.text or ""
     soup = BeautifulSoup(html, "html.parser")
@@ -225,8 +226,8 @@ def main() -> None:
                 all_lists.append(res)
             except Exception as e:
                 if debug:
-                    print("DDG error for query:", q)
-                    print("DDG error:", str(e))
+                    print("DDG error for query:", q, file=sys.stderr)
+                    print("DDG error:", str(e), file=sys.stderr)
                 all_lists.append([])
 
         merged = merge_dedupe(all_lists, max_results=args.max)
