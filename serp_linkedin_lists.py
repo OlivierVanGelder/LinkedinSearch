@@ -150,107 +150,63 @@ def merge_dedupe(results_lists: List[List[SerpResult]], max_results: int = 10) -
 
 
 def build_query_sets(company: str, extra: Optional[str] = None) -> Dict[str, List[str]]:
-    """
-    Genereert brede, dynamische queries op basis van de meegegeven bedrijfsnaam.
-    Geen hardcoded bedrijfsnamen.
-    """
     company = (company or "").strip()
     extra = (extra or "").strip()
 
-    # Normaliseer extra context, bijv. BREDA -> Breda
     extra_norm = extra.title() if extra else ""
-    extra_part = f" {extra_norm}" if extra_norm else ""
+    extra_strict = f" {extra_norm}" if extra_norm else ""
+    extra_soft = f" ({extra_norm} OR Gelderland)" if extra_norm else ""
 
-    # Varianten van bedrijfsnaam
-    company_original = company
     company_no_dashes = re.sub(r"[-–—]+", " ", company).strip()
     company_no_dashes = re.sub(r"\s+", " ", company_no_dashes)
 
-    # Kernnaam zonder rechtsvorm of prefixen
-    # Dit is bewust simpel gehouden
-    core_name = company_no_dashes
-    core_name = re.sub(
-        r"\b(stichting|vereniging|bv|b\.v\.|nv|n\.v\.|holding|groep)\b",
+    core = re.sub(
+        r"\b(bv|b\.v\.|nv|n\.v\.|holding|groep|stichting|vereniging)\b\.?",
         "",
-        core_name,
+        company_no_dashes,
         flags=re.IGNORECASE,
     ).strip()
 
-    name_variants = list(dict.fromkeys([
-        company_original,
-        company_no_dashes,
-        core_name,
-    ]))
+    words = core.split() if core else company_no_dashes.split()
+    short = " ".join(words[:4]).strip()
 
-    # Strategie 1: brede people search
-    people_broad = []
-    for name in name_variants:
-        people_broad.append(
-            f'site:linkedin.com ("{name}"){extra_part}'
-        )
+    name_variants = []
+    for n in [core, short, company_no_dashes, company]:
+        if n and n not in name_variants:
+            name_variants.append(n)
 
-    # Strategie 2: people met relevante rollen
-    role_block = "(communicatie OR marketing OR online OR digital OR digitaal OR website OR web OR content)"
-    people_roles = []
-    for name in name_variants:
-        people_roles.append(
-            f'site:linkedin.com ("{name}") {role_block}{extra_part}'
-        )
-
-    # Strategie 3: company pages
-    company_page = []
-    for name in name_variants:
-        company_page.append(
-            f'site:linkedin.com/company ("{name}")'
-        )
-
-    return {
-        "strategy_people_broad": people_broad,
-        "strategy_people_roles": people_roles,
-        "strategy_company_page": company_page,
-    }
-
-    """
-    Brede queries, niet te strikt.
-    We filteren pas na ophalen op linkedin.com/in en linkedin.com/company.
-
-    Strategieën:
-    - strategy_people_broad: brede people search
-    - strategy_people_roles: people met rolwoorden
-    - strategy_company_page: bedrijfspagina
-    """
-    company = (company or "").strip()
-    extra = (extra or "").strip()
-
-    # Normaliseer extra: BREDA -> Breda
-    extra_norm = extra.title() if extra else ""
-    extra_part = f" {extra_norm}" if extra_norm else ""
-
-    # Maak ook een variant zonder streepjes, want dat verschilt vaak
-    company_clean = re.sub(r"[-–—]+", " ", company).strip()
-    company_clean = re.sub(r"\s+", " ", company_clean)
+    role_block = "(marketing OR communicatie OR online OR digital OR digitaal OR website OR web OR content)"
+    seniority_block = '(eigenaar OR directeur OR founder OR oprichter OR manager OR "head of" OR lead)'
 
     people_broad = [
-        f'site:linkedin.com ("Breda Actief"){extra_part}',
-        f'site:linkedin.com ("{company_clean}"){extra_part}',
-        f'site:linkedin.com ("{company}"){extra_part}',
+        f'site:linkedin.com/in ("{n}"){extra_strict}'
+        for n in name_variants
     ]
+    if core and extra_soft:
+        people_broad.append(f'site:linkedin.com/in ("{core}"){extra_soft}')
 
     people_roles = [
-        f'site:linkedin.com ("Breda Actief") (communicatie OR marketing OR online OR digital OR digitaal){extra_part}',
-        f'site:linkedin.com ("{company_clean}") (communicatie OR marketing OR online OR digital OR digitaal){extra_part}',
-        f'site:linkedin.com ("Breda Actief") (website OR web OR content OR social){extra_part}',
+        f'site:linkedin.com/in ("{n}") {role_block}{extra_strict}'
+        for n in name_variants
     ]
+    if core and extra_soft:
+        people_roles.append(f'site:linkedin.com/in ("{core}") {role_block}{extra_soft}')
+
+    people_seniority = []
+    if core:
+        people_seniority.append(f'site:linkedin.com/in ("{core}") {seniority_block}{extra_strict}')
+        if extra_soft:
+            people_seniority.append(f'site:linkedin.com/in ("{core}") {seniority_block}{extra_soft}')
 
     company_page = [
-        'site:linkedin.com/company ("Breda Actief")',
-        f'site:linkedin.com/company ("{company_clean}")',
-        f'site:linkedin.com/company ("{company}")',
+        f'site:linkedin.com/company ("{n}")'
+        for n in name_variants
     ]
 
     return {
         "strategy_people_broad": people_broad,
         "strategy_people_roles": people_roles,
+        "strategy_people_seniority": people_seniority,
         "strategy_company_page": company_page,
     }
 
