@@ -151,6 +151,66 @@ def merge_dedupe(results_lists: List[List[SerpResult]], max_results: int = 10) -
 
 def build_query_sets(company: str, extra: Optional[str] = None) -> Dict[str, List[str]]:
     """
+    Genereert brede, dynamische queries op basis van de meegegeven bedrijfsnaam.
+    Geen hardcoded bedrijfsnamen.
+    """
+    company = (company or "").strip()
+    extra = (extra or "").strip()
+
+    # Normaliseer extra context, bijv. BREDA -> Breda
+    extra_norm = extra.title() if extra else ""
+    extra_part = f" {extra_norm}" if extra_norm else ""
+
+    # Varianten van bedrijfsnaam
+    company_original = company
+    company_no_dashes = re.sub(r"[-–—]+", " ", company).strip()
+    company_no_dashes = re.sub(r"\s+", " ", company_no_dashes)
+
+    # Kernnaam zonder rechtsvorm of prefixen
+    # Dit is bewust simpel gehouden
+    core_name = company_no_dashes
+    core_name = re.sub(
+        r"\b(stichting|vereniging|bv|b\.v\.|nv|n\.v\.|holding|groep)\b",
+        "",
+        core_name,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    name_variants = list(dict.fromkeys([
+        company_original,
+        company_no_dashes,
+        core_name,
+    ]))
+
+    # Strategie 1: brede people search
+    people_broad = []
+    for name in name_variants:
+        people_broad.append(
+            f'site:linkedin.com ("{name}"){extra_part}'
+        )
+
+    # Strategie 2: people met relevante rollen
+    role_block = "(communicatie OR marketing OR online OR digital OR digitaal OR website OR web OR content)"
+    people_roles = []
+    for name in name_variants:
+        people_roles.append(
+            f'site:linkedin.com ("{name}") {role_block}{extra_part}'
+        )
+
+    # Strategie 3: company pages
+    company_page = []
+    for name in name_variants:
+        company_page.append(
+            f'site:linkedin.com/company ("{name}")'
+        )
+
+    return {
+        "strategy_people_broad": people_broad,
+        "strategy_people_roles": people_roles,
+        "strategy_company_page": company_page,
+    }
+
+    """
     Brede queries, niet te strikt.
     We filteren pas na ophalen op linkedin.com/in en linkedin.com/company.
 
@@ -199,10 +259,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Return 3 SERP lists for LinkedIn discovery using DuckDuckGo Lite.")
     parser.add_argument("--company", required=True, help="Bedrijfsnaam, bijvoorbeeld: Stichting Breda-Actief")
     parser.add_argument("--extra", default="", help="Extra context, bijvoorbeeld stad of domein")
+    parser.add_argument("--tags", default="", help="Tags, gescheiden door komma's")
     parser.add_argument("--max", type=int, default=10, help="Max resultaten per strategie (default 10)")
     parser.add_argument("--timeout", type=int, default=25, help="HTTP timeout seconden (default 25)")
     parser.add_argument("--debug", action="store_true", help="Print debug output (status, length, head html)")
     args = parser.parse_args()
+
+    raw_tags = args.tags or ""
+    tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()]
+
 
     # Debug is standaard aan zoals gevraagd, tenzij je het expliciet uitzet door --debug niet te gebruiken?
     # Jij wilde debug regels altijd, dus we zetten hem standaard True.
@@ -213,6 +278,7 @@ def main() -> None:
     output: Dict[str, object] = {
         "company": args.company,
         "extra": args.extra,
+        "tags": tags_list,
         "queries": query_sets,
         "results": {},
     }

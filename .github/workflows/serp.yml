@@ -10,6 +10,10 @@ on:
         description: "Extra context zoals plaats of domein"
         required: false
         default: ""
+      tags:
+        description: "Tags om te gebruiken in n8n, gescheiden door komma's"
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -34,6 +38,7 @@ jobs:
           python serp_linkedin_lists.py \
             --company "${{ inputs.company }}" \
             --extra "${{ inputs.extra }}" \
+            --tags "${{ inputs.tags }}" \
             --max 10 \
             > output.json
 
