@@ -38,84 +38,69 @@ class SerpResult:
 def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
+def ddg_search(query: str, max_results: int = 10, timeout: int = 25, debug: bool = True) -> List[SerpResult]:
+    """
+    DuckDuckGo search met fallback:
+    - eerst html.duckduckgo.com (GET)
+    - parse alle links
+    - filter op LinkedIn profielen en company pages
+    """
 
-def ddg_search_lite(query: str, max_results: int = 10, timeout: int = 25, debug: bool = True) -> List[SerpResult]:
-    """
-    Query DuckDuckGo Lite endpoint and parse LinkedIn URLs from the HTML.
-    Uses POST https://lite.duckduckgo.com/lite/ with form data {"q": query}.
-    """
-    base = "https://lite.duckduckgo.com/lite/"
+    session = requests.Session()
+
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
         "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.7",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://lite.duckduckgo.com",
-        "Referer": "https://lite.duckduckgo.com/lite/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+        "Referer": "https://duckduckgo.com/",
     }
 
-    # mild rate limiting to reduce the chance of getting blocked
-    time.sleep(1.2 + random.random() * 1.0)
+    time.sleep(1.2 + random.random())
 
-    resp = requests.post(base, data={"q": query}, headers=headers, timeout=timeout)
+    resp = session.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": query},
+        headers=headers,
+        timeout=timeout,
+    )
     resp.raise_for_status()
 
     if debug:
         print("DDG status:", resp.status_code, file=sys.stderr)
-        print("DDG length:", len(resp.text or ""), file=sys.stderr)
-        print("DDG head (800):", file=sys.stderr)
-        print((resp.text or "")[:800], file=sys.stderr)
+        print("DDG length:", len(resp.text), file=sys.stderr)
+        print("DDG head (400):", file=sys.stderr)
+        print(resp.text[:400], file=sys.stderr)
 
-
-    html = resp.text or ""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(resp.text, "html.parser")
 
     results: List[SerpResult] = []
     seen = set()
 
-    def extract_real_url(href: str) -> str:
-        href = (href or "").strip()
-        if not href:
-            return ""
-
-        # Vaak DDG redirect: /l/?uddg=https%3A%2F%2Fwww.linkedin.com%2Fin%2F...
-        if "uddg=" in href:
-            # Kan relatief zijn
-            if href.startswith("/"):
-                href_full = "https://lite.duckduckgo.com" + href
-            else:
-                href_full = href
-
-            parsed = urlparse(href_full)
-            qs = parse_qs(parsed.query)
-            if "uddg" in qs and qs["uddg"]:
-                return unquote(qs["uddg"][0])
-
-        return href
-
     for a in soup.select("a[href]"):
         href = a.get("href") or ""
-        url = extract_real_url(href)
+        if "uddg=" in href:
+            parsed = urlparse(href)
+            qs = parse_qs(parsed.query)
+            href = unquote(qs.get("uddg", [""])[0])
 
-        if not url:
+        if not href:
             continue
 
-        # Filter: alleen LinkedIn profielen of bedrijfspagina's
-        if "linkedin.com/in/" not in url and "linkedin.com/company/" not in url:
+        if "linkedin.com/in/" not in href and "linkedin.com/company/" not in href:
             continue
 
-        # Normaliseer tracking fragmenten
-        url = url.split("#")[0].strip()
-
-        if url in seen:
+        href = href.split("#")[0]
+        if href in seen:
             continue
-        seen.add(url)
+        seen.add(href)
 
-        title = _clean_text(a.get_text()) or url
+        title = _clean_text(a.get_text()) or href
 
         results.append(
             SerpResult(
                 title=title,
-                url=url,
+                url=href,
                 snippet="",
                 source_query=query,
             )
@@ -244,7 +229,7 @@ def main() -> None:
 
         for q in queries:
             try:
-                res = ddg_search_lite(q, max_results=args.max, timeout=args.timeout, debug=debug)
+                res = ddg_search(q, max_results=args.max, timeout=args.timeout, debug=debug)
                 all_lists.append(res)
             except Exception as e:
                 if debug:
