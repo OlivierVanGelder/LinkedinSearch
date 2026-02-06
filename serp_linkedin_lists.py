@@ -138,6 +138,22 @@ def _parse_linkedin_links(html: str, source_query: str, max_results: int, want: 
         )
         if len(results) >= max_results:
             break
+        
+        if not results:
+            pattern = r"https://www\.linkedin\.com/(?:in|company)/[^\s\"\'<>]+"
+            for url in re.findall(pattern, html or ""):
+                url = url.split("?")[0].split("#")[0]
+                if want == "people" and "linkedin.com/in/" not in url:
+                    continue
+                if want == "companies" and "linkedin.com/company/" not in url:
+                    continue
+                if url in seen:
+                    continue
+                seen.add(url)
+                results.append(SerpResult(title=url, url=url, snippet="", source_query=source_query))
+                if len(results) >= max_results:
+                    break
+
 
     return results
 
@@ -200,6 +216,11 @@ def linkedin_search(
         try:
             resp = session.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
             html = resp.text or ""
+            low = html.lower()
+            if "authwall" in low or "signin" in low or "sign in" in low or "join linkedin" in low:
+                diagnostics["blocked"] = True
+                continue
+
             diagnostics["status"] = resp.status_code
 
             if debug:
@@ -274,7 +295,7 @@ def build_query_sets(company: str, extra: Optional[str] = None) -> Dict[str, Lis
         if n and n not in base_names:
             base_names.append(n)
 
-    extra_part = f" {extra}".strip() if extra else ""
+    extra_part = f" {extra}" if extra else ""
 
     # Strategie 1: breed op bedrijfsnaam
     people_broad = [f"{n}{extra_part}".strip() for n in base_names]
