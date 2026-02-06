@@ -2,15 +2,16 @@
 """
 serp_linkedin_lists.py
 
-Zoekt via DuckDuckGo en levert lijsten terug (top N) op basis van meerdere strategieën.
-Robuuste aanpak:
-- Probeert eerst https://html.duckduckgo.com/html/ (GET) met q=...
-- Als dat niet bruikbaar is, fallback naar https://duckduckgo.com/html/ (GET)
-- Als dat niet bruikbaar is, fallback naar https://lite.duckduckgo.com/lite/ (POST)
-- Decode DDG redirect links (uddg)
-- Filtert op LinkedIn /in en /company
-- Dedupe op URL
-- Debug gaat naar stderr, stdout blijft pure JSON (voor output.json en webhook)
+Zoekt direct in LinkedIn Search en levert lijsten terug (top N) per strategie.
+
+Waarom deze aanpak:
+- DuckDuckGo en andere zoekmachines blokkeren GitHub Actions vaak (status 202, lege SERP).
+- LinkedIn Search endpoints geven (soms beperkt) publiek HTML terug waarin profiel- en company-links staan.
+- We parseren alleen LinkedIn links (/in/ en /company/) en dedupliceren.
+
+Let op:
+- LinkedIn kan throttlen of blokkeren (status 999, 429). We gebruiken jitter en beperkte requests.
+- Resultaten kunnen wisselen of beperkt zijn zonder ingelogde sessie.
 
 Gebruik:
   python serp_linkedin_lists.py --company "Stichting Breda-Actief" --extra "Breda" --tags "tag1,tag2" --max 10 > output.json
@@ -23,8 +24,8 @@ import random
 import re
 import time
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
-from urllib.parse import urlparse, parse_qs, unquote
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,56 +39,95 @@ class SerpResult:
     source_query: str
 
 
+def _sleep_jitter(base: float = 2.0, jitter: float = 2.0) -> None:
+    # LinkedIn is snel gevoelig voor bursts. Jitter helpt, zeker in Actions.
+    time.sleep(max(0.0, base + random.random() * jitter))
+
+
 def _clean_text(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def _sleep_jitter(base: float = 1.1, jitter: float = 0.9) -> None:
-    time.sleep(base + random.random() * jitter)
-
-
-def _extract_real_url(href: str) -> str:
+def _to_abs_linkedin_url(href: str) -> str:
     href = (href or "").strip()
     if not href:
         return ""
-
-    if "uddg=" in href:
-        # Kan relatief zijn
-        if href.startswith("/"):
-            href_full = "https://duckduckgo.com" + href
-        else:
-            href_full = href
-
-        parsed = urlparse(href_full)
-        qs = parse_qs(parsed.query)
-        if "uddg" in qs and qs["uddg"]:
-            return unquote(qs["uddg"][0])
-
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return "https://www.linkedin.com" + href
     return href
 
 
-def _parse_linkedin_results(html: str, source_query: str, max_results: int) -> List[SerpResult]:
+def _unwrap_linkedin_authwall(url: str) -> str:
+    # LinkedIn gebruikt vaak /authwall?sessionRedirect=<encoded_url>
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        if "linkedin.com" not in (parsed.netloc or ""):
+            return url
+        if "/authwall" not in (parsed.path or ""):
+            return url
+
+        qs = parse_qs(parsed.query or "")
+        redirect = ""
+        if "sessionRedirect" in qs and qs["sessionRedirect"]:
+            redirect = qs["sessionRedirect"][0]
+        elif "trk" in qs and qs["trk"]:
+            # soms staat redirect niet in sessionRedirect; laat dan de url zoals hij is
+            redirect = ""
+
+        if redirect:
+            redirect = unquote(redirect)
+            # redirect kan relatief zijn
+            redirect = _to_abs_linkedin_url(redirect)
+            return redirect
+        return url
+    except Exception:
+        return url
+
+
+def _extract_real_url(href: str) -> str:
+    url = _to_abs_linkedin_url(href)
+    url = _unwrap_linkedin_authwall(url)
+    url = (url or "").split("#")[0].strip()
+    return url
+
+
+def _parse_linkedin_links(html: str, source_query: str, max_results: int, want: str) -> List[SerpResult]:
     soup = BeautifulSoup(html or "", "html.parser")
     results: List[SerpResult] = []
     seen = set()
 
+    # We nemen anchors, maar filteren strikt op LinkedIn paths
     for a in soup.select("a[href]"):
         href = a.get("href") or ""
         url = _extract_real_url(href)
-
         if not url:
             continue
 
-        if "linkedin.com/in/" not in url and "linkedin.com/company/" not in url:
-            continue
+        # Normaliseer tracking
+        if "?" in url:
+            url = url.split("?")[0]
 
-        url = url.split("#")[0].strip()
-        if not url or url in seen:
+        if want == "people":
+            if "linkedin.com/in/" not in url:
+                continue
+        elif want == "companies":
+            if "linkedin.com/company/" not in url:
+                continue
+        else:
+            if "linkedin.com/in/" not in url and "linkedin.com/company/" not in url:
+                continue
+
+        if url in seen:
             continue
         seen.add(url)
 
         title = _clean_text(a.get_text()) or url
-
         results.append(
             SerpResult(
                 title=title,
@@ -96,127 +136,101 @@ def _parse_linkedin_results(html: str, source_query: str, max_results: int) -> L
                 source_query=source_query,
             )
         )
-
         if len(results) >= max_results:
             break
 
     return results
 
 
-def _looks_like_results_page(html: str) -> bool:
+def _looks_like_linkedin_search(html: str) -> bool:
     if not html:
         return False
-
     h = html.lower()
-
-    # Als er LinkedIn in de HTML zit, is het meestal al goed genoeg
-    if "linkedin.com/in/" in h or "linkedin.com/company/" in h:
+    # Een echte search pagina heeft meestal 'search' of resultaten container.
+    if "search" in h and "linkedin" in h and ("/in/" in h or "/company/" in h):
         return True
-
-    # Sommige DDG HTML varianten gebruiken 'result' classes/ids
-    if "result__a" in h or "result-link" in h or "results" in h:
+    # Ook een login wall kan nog links bevatten, dus check op /in/ of /company/
+    if "/in/" in h or "/company/" in h:
         return True
-
     return False
 
 
-def ddg_search(query: str, max_results: int = 10, timeout: int = 25, debug: bool = True) -> List[SerpResult]:
+def linkedin_search(
+    keywords: str,
+    kind: str,
+    max_results: int = 10,
+    timeout: int = 25,
+    debug: bool = True,
+) -> Tuple[List[SerpResult], Dict[str, object]]:
     """
-    Probeert meerdere DDG endpoints in volgorde en pakt LinkedIn URLs uit de HTML.
+    kind: 'people' of 'companies'
+    Geeft resultaten plus diagnostics terug.
     """
-
     session = requests.Session()
 
-    headers_common = {
+    headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
         "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.7",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
+        "Referer": "https://www.linkedin.com/",
     }
 
-    attempts: List[Dict[str, object]] = [
-        {
-            "name": "DDG_HTML_1",
-            "method": "GET",
-            "url": "https://html.duckduckgo.com/html/",
-            "params": {"q": query},
-            "data": None,
-            "headers": {**headers_common, "Referer": "https://duckduckgo.com/"},
-        },
-        {
-            "name": "DDG_HTML_2",
-            "method": "GET",
-            "url": "https://duckduckgo.com/html/",
-            "params": {"q": query},
-            "data": None,
-            "headers": {**headers_common, "Referer": "https://duckduckgo.com/"},
-        },
-        {
-            "name": "DDG_LITE",
-            "method": "POST",
-            "url": "https://lite.duckduckgo.com/lite/",
-            "params": None,
-            "data": {"q": query},
-            "headers": {
-                **headers_common,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://lite.duckduckgo.com",
-                "Referer": "https://lite.duckduckgo.com/lite/",
-            },
-        },
-    ]
+    base = "https://www.linkedin.com/search/results/"
+    if kind == "people":
+        url = base + "people/"  # publiek toegankelijk, maar kan limiteren
+    else:
+        url = base + "companies/"
 
-    last_html = ""
-    for i, att in enumerate(attempts):
-        _sleep_jitter(1.0, 1.0)
+    params = {
+        "keywords": keywords,
+        "origin": "GLOBAL_SEARCH_HEADER",
+    }
 
-        name = str(att["name"])
-        method = str(att["method"])
-        url = str(att["url"])
-        params = att.get("params")
-        data = att.get("data")
-        headers = att.get("headers") or headers_common
+    diagnostics: Dict[str, object] = {
+        "kind": kind,
+        "keywords": keywords,
+        "status": None,
+        "blocked": False,
+    }
 
+    # Beperk aantal pogingen om niet agressief te worden
+    for attempt in range(1, 4):
+        _sleep_jitter(2.0, 2.5)
         try:
-            if method == "GET":
-                resp = session.get(url, params=params, headers=headers, timeout=timeout)
-            else:
-                resp = session.post(url, data=data, headers=headers, timeout=timeout)
-
-            last_html = resp.text or ""
+            resp = session.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
+            html = resp.text or ""
+            diagnostics["status"] = resp.status_code
 
             if debug:
+                name = f"LI_{kind.upper()}_{attempt}"
                 print(f"{name} status: {resp.status_code}", file=sys.stderr)
-                print(f"{name} length: {len(last_html)}", file=sys.stderr)
+                print(f"{name} length: {len(html)}", file=sys.stderr)
                 print(f"{name} head (400):", file=sys.stderr)
-                print(last_html[:400], file=sys.stderr)
+                print(html[:400], file=sys.stderr)
 
-            # Alleen bij 200 proberen we te parsen
+            # LinkedIn anti-bot: vaak 999. Soms 429.
+            if resp.status_code in (429, 999, 403):
+                diagnostics["blocked"] = True
+                continue
+
             if resp.status_code != 200:
                 continue
 
-            # Sommige responses zijn "landing pages" zonder resultaten
-            if not _looks_like_results_page(last_html):
+            if not _looks_like_linkedin_search(html):
                 continue
 
-            parsed = _parse_linkedin_results(last_html, source_query=query, max_results=max_results)
-
-            # Als we meteen LinkedIn urls hebben, klaar
+            parsed = _parse_linkedin_links(html, source_query=keywords, max_results=max_results, want=kind)
             if parsed:
-                return parsed
-
-            # Als er geen LinkedIn urls zijn, kan het alsnog een results page zijn,
-            # maar dan is je query te strikt. We proberen nog een volgende attempt.
-            continue
+                return parsed, diagnostics
 
         except Exception as e:
             if debug:
-                print(f"{name} error for query: {query}", file=sys.stderr)
-                print(f"{name} error: {str(e)}", file=sys.stderr)
+                print(f"LI_{kind.upper()} error for keywords: {keywords}", file=sys.stderr)
+                print(f"LI_{kind.upper()} error: {str(e)}", file=sys.stderr)
             continue
 
-    # Als alles faalt: geen resultaten
-    return []
+    return [], diagnostics
 
 
 def merge_dedupe(results_lists: List[List[SerpResult]], max_results: int = 10) -> List[SerpResult]:
@@ -242,73 +256,80 @@ def build_query_sets(company: str, extra: Optional[str] = None) -> Dict[str, Lis
     company = (company or "").strip()
     extra = (extra or "").strip()
 
-    extra_norm = extra.title() if extra else ""
-    extra_strict = f" {extra_norm}" if extra_norm else ""
-    extra_soft = f" ({extra_norm} OR Gelderland)" if extra_norm else ""
-
-    company_no_dashes = re.sub(r"[-–—]+", " ", company).strip()
-    company_no_dashes = re.sub(r"\s+", " ", company_no_dashes)
+    # Normaliseer bedrijfsnaam (verwijder veelvoorkomende suffixen)
+    company_no_punct = re.sub(r"[\t\n\r]+", " ", company).strip()
+    company_no_punct = re.sub(r"\s+", " ", company_no_punct)
 
     core = re.sub(
         r"\b(bv|b\.v\.|nv|n\.v\.|holding|groep|stichting|vereniging)\b\.?",
         "",
-        company_no_dashes,
+        company_no_punct,
         flags=re.IGNORECASE,
     ).strip()
     core = re.sub(r"\s+", " ", core).strip()
 
-    words = core.split() if core else company_no_dashes.split()
-    short = " ".join(words[:4]).strip() if words else core
-
-    name_variants: List[str] = []
-    for n in [core, short, company_no_dashes, company]:
+    base_names = []
+    for n in [core, company_no_punct, company]:
         n = (n or "").strip()
-        if n and n not in name_variants:
-            name_variants.append(n)
+        if n and n not in base_names:
+            base_names.append(n)
 
-    role_block = "(marketing OR communicatie OR online OR digital OR digitaal OR website OR web OR content)"
-    seniority_block = '(eigenaar OR directeur OR founder OR oprichter OR manager OR "head of" OR lead)'
+    extra_part = f" {extra}".strip() if extra else ""
 
-    people_broad = [f'site:linkedin.com/in ("{n}"){extra_strict}' for n in name_variants]
-    if core and extra_soft:
-        people_broad.append(f'site:linkedin.com/in ("{core}"){extra_soft}')
+    # Strategie 1: breed op bedrijfsnaam
+    people_broad = [f"{n}{extra_part}".strip() for n in base_names]
 
-    people_roles = [f'site:linkedin.com/in ("{n}") {role_block}{extra_strict}' for n in name_variants]
-    if core and extra_soft:
-        people_roles.append(f'site:linkedin.com/in ("{core}") {role_block}{extra_soft}')
+    # Strategie 2: rollen rond marketing/communicatie
+    role_terms = ["marketing", "communicatie", "online marketing", "digital marketing", "content"]
+    people_roles = []
+    for n in base_names[:2]:
+        for rt in role_terms[:3]:
+            people_roles.append(f"{n} {rt}{extra_part}".strip())
 
-    people_seniority: List[str] = []
-    if core:
-        people_seniority.append(f'site:linkedin.com/in ("{core}") {seniority_block}{extra_strict}')
-        if extra_soft:
-            people_seniority.append(f'site:linkedin.com/in ("{core}") {seniority_block}{extra_soft}')
-    elif name_variants:
-        people_seniority.append(f'site:linkedin.com/in ("{name_variants[0]}") {seniority_block}{extra_strict}')
+    # Strategie 3: senioriteit
+    seniority_terms = ["directeur", "eigenaar", "founder", "oprichter", "manager"]
+    people_seniority = []
+    for n in base_names[:2]:
+        for st in seniority_terms[:3]:
+            people_seniority.append(f"{n} {st}{extra_part}".strip())
 
-    company_page = [f'site:linkedin.com/company ("{n}")' for n in name_variants]
+    # Strategie 4: bedrijfspagina
+    company_page = [f"{n}".strip() for n in base_names]
+
+    # Dedup per lijst
+    def dedup_list(xs: List[str]) -> List[str]:
+        out = []
+        seen = set()
+        for x in xs:
+            x = (x or "").strip()
+            if not x or x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
 
     return {
-        "strategy_people_broad": people_broad,
-        "strategy_people_roles": people_roles,
-        "strategy_people_seniority": people_seniority,
-        "strategy_company_page": company_page,
+        "strategy_people_broad": dedup_list(people_broad),
+        "strategy_people_roles": dedup_list(people_roles),
+        "strategy_people_seniority": dedup_list(people_seniority),
+        "strategy_company_page": dedup_list(company_page),
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Return SERP lists for LinkedIn discovery using DuckDuckGo.")
+    parser = argparse.ArgumentParser(description="Return LinkedIn search lists for LinkedIn discovery (zonder externe SERP API). ")
     parser.add_argument("--company", required=True, help="Bedrijfsnaam, bijvoorbeeld: Stichting Breda-Actief")
     parser.add_argument("--extra", default="", help="Extra context, bijvoorbeeld stad of domein")
     parser.add_argument("--tags", default="", help="Tags, gescheiden door komma's")
     parser.add_argument("--max", type=int, default=10, help="Max resultaten per strategie (default 10)")
     parser.add_argument("--timeout", type=int, default=25, help="HTTP timeout seconden (default 25)")
-    parser.add_argument("--debug", action="store_true", help="Zet debug expliciet aan (wordt standaard al gedaan)")
+    parser.add_argument("--debug", action="store_true", help="Zet debug expliciet aan (debug staat in Actions meestal aan)")
     args = parser.parse_args()
 
     raw_tags = args.tags or ""
     tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()]
 
-    # Debug altijd aan, naar stderr
+    # Debug altijd aan, naar stderr. Flag blijft bestaan voor lokale runs.
     debug = True
 
     query_sets = build_query_sets(args.company, args.extra)
@@ -319,23 +340,23 @@ def main() -> None:
         "tags": tags_list,
         "queries": query_sets,
         "results": {},
+        "diagnostics": {},
     }
 
     for strategy, queries in query_sets.items():
         all_lists: List[List[SerpResult]] = []
+        diag_list: List[Dict[str, object]] = []
+
+        kind = "companies" if strategy == "strategy_company_page" else "people"
 
         for q in queries:
-            try:
-                res = ddg_search(q, max_results=args.max, timeout=args.timeout, debug=debug)
-                all_lists.append(res)
-            except Exception as e:
-                if debug:
-                    print("DDG error for query:", q, file=sys.stderr)
-                    print("DDG error:", str(e), file=sys.stderr)
-                all_lists.append([])
+            res, diag = linkedin_search(q, kind=kind, max_results=args.max, timeout=args.timeout, debug=debug)
+            all_lists.append(res)
+            diag_list.append(diag)
 
         merged = merge_dedupe(all_lists, max_results=args.max)
         output["results"][strategy] = [asdict(x) for x in merged]
+        output["diagnostics"][strategy] = diag_list
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
 

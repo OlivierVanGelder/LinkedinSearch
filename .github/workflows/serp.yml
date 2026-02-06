@@ -35,7 +35,7 @@ jobs:
 
       - name: Run SERP script
         run: |
-          python serp_linkedin_lists.py \
+          python serp_linkedin_lists_updated.py \
             --company "${{ inputs.company }}" \
             --extra "${{ inputs.extra }}" \
             --tags "${{ inputs.tags }}" \
