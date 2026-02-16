@@ -33,22 +33,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run SERP script
+      - name: Run SERP script (Bing)
         run: |
-          python serp_linkedin_lists.py \
+          python serp_linkedin_lists_bing.py \
             --company "${{ inputs.company }}" \
             --extra "${{ inputs.extra }}" \
             --tags "${{ inputs.tags }}" \
             --max 10 \
             > output.json
 
+      - name: Validate JSON
+        run: |
+          python -c "import json; json.load(open('output.json','r',encoding='utf-8'))"
+
       - name: Send result to n8n webhook
         run: |
           curl -X POST \
             -H "Content-Type: application/json" \
+            --fail \
             --data @output.json \
             https://rbmedia.app.n8n.cloud/webhook/3c0d49a0-66bf-4a3c-a718-dc4f8d03669d
-
-      - name: Validate JSON
-        run: |
-          python -c "import json; json.load(open('output.json','r',encoding='utf-8')); print('json ok')"

@@ -138,27 +138,11 @@ def _parse_linkedin_links(html: str, source_query: str, max_results: int, want: 
         )
         if len(results) >= max_results:
             break
-        
-        if not results:
-            pattern = r"https://www\.linkedin\.com/(?:in|company)/[^\s\"\'<>]+"
-            for url in re.findall(pattern, html or ""):
-                url = url.split("?")[0].split("#")[0]
-                if want == "people" and "linkedin.com/in/" not in url:
-                    continue
-                if want == "companies" and "linkedin.com/company/" not in url:
-                    continue
-                if url in seen:
-                    continue
-                seen.add(url)
-                results.append(SerpResult(title=url, url=url, snippet="", source_query=source_query))
-                if len(results) >= max_results:
-                    break
-
 
     return results
 
 
-def _looks_like_linkedin_search(html: str) -> bool:
+def _looks_like_bing_search(html: str) -> bool:
     if not html:
         return False
     h = html.lower()
@@ -171,7 +155,7 @@ def _looks_like_linkedin_search(html: str) -> bool:
     return False
 
 
-def linkedin_search(
+def bing_search(
     keywords: str,
     kind: str,
     max_results: int = 10,
@@ -179,8 +163,12 @@ def linkedin_search(
     debug: bool = True,
 ) -> Tuple[List[SerpResult], Dict[str, object]]:
     """
+    Zoekt via Bing HTML en filtert op LinkedIn links.
     kind: 'people' of 'companies'
     Geeft resultaten plus diagnostics terug.
+
+    Dit is stabieler dan direct LinkedIn Search vanuit GitHub Actions,
+    omdat LinkedIn agressief blokkeert datacenter IPs.
     """
     session = requests.Session()
 
@@ -189,18 +177,17 @@ def linkedin_search(
         "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.7",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
-        "Referer": "https://www.linkedin.com/",
     }
 
-    base = "https://www.linkedin.com/search/results/"
-    if kind == "people":
-        url = base + "people/"  # publiek toegankelijk, maar kan limiteren
-    else:
-        url = base + "companies/"
+    site = "site:linkedin.com/in/" if kind == "people" else "site:linkedin.com/company/"
+    q = f"{site} {keywords}".strip()
 
+    url = "https://www.bing.com/search"
     params = {
-        "keywords": keywords,
-        "origin": "GLOBAL_SEARCH_HEADER",
+        "q": q,
+        "setlang": "nl-nl",
+        "cc": "NL",
+        "count": str(max(10, min(50, max_results * 2))),
     }
 
     diagnostics: Dict[str, object] = {
@@ -210,45 +197,91 @@ def linkedin_search(
         "blocked": False,
     }
 
-    # Beperk aantal pogingen om niet agressief te worden
+    def _extract_linkedin_url(raw: str) -> str:
+        raw = (raw or "").strip()
+        if not raw:
+            return ""
+        if "linkedin.com/" in raw:
+            return raw.split("?")[0].split("#")[0]
+        try:
+            parsed = urlparse(raw)
+            qs = parse_qs(parsed.query or "")
+            for key in ["url", "u", "r", "RU", "target"]:
+                if key in qs and qs[key]:
+                    candidate = unquote(qs[key][0])
+                    if "linkedin.com/" in candidate:
+                        return candidate.split("?")[0].split("#")[0]
+        except Exception:
+            return ""
+        return ""
+
     for attempt in range(1, 4):
-        _sleep_jitter(2.0, 2.5)
+        _sleep_jitter(1.5, 2.5)
         try:
             resp = session.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
             html = resp.text or ""
-            low = html.lower()
-            if "authwall" in low or "signin" in low or "sign in" in low or "join linkedin" in low:
-                diagnostics["blocked"] = True
-                continue
-
             diagnostics["status"] = resp.status_code
 
             if debug:
-                name = f"LI_{kind.upper()}_{attempt}"
+                name = f"BING_{kind.upper()}_{attempt}"
                 print(f"{name} status: {resp.status_code}", file=sys.stderr)
                 print(f"{name} length: {len(html)}", file=sys.stderr)
                 print(f"{name} head (400):", file=sys.stderr)
                 print(html[:400], file=sys.stderr)
 
-            # LinkedIn anti-bot: vaak 999. Soms 429.
-            if resp.status_code in (429, 999, 403):
+            if resp.status_code in (429, 403):
                 diagnostics["blocked"] = True
                 continue
 
             if resp.status_code != 200:
                 continue
 
-            if not _looks_like_linkedin_search(html):
+            low = html.lower()
+            if "unusual traffic" in low or "captcha" in low or "verify you are a human" in low:
+                diagnostics["blocked"] = True
                 continue
 
-            parsed = _parse_linkedin_links(html, source_query=keywords, max_results=max_results, want=kind)
-            if parsed:
-                return parsed, diagnostics
+            results: List[SerpResult] = []
+            seen = set()
 
-        except Exception as e:
-            if debug:
-                print(f"LI_{kind.upper()} error for keywords: {keywords}", file=sys.stderr)
-                print(f"LI_{kind.upper()} error: {str(e)}", file=sys.stderr)
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.select("li.b_algo h2 a[href]"):
+                href = a.get("href") or ""
+                clean = _extract_linkedin_url(href)
+                if not clean:
+                    continue
+                if kind == "people" and "linkedin.com/in/" not in clean:
+                    continue
+                if kind != "people" and "linkedin.com/company/" not in clean:
+                    continue
+                if clean in seen:
+                    continue
+                seen.add(clean)
+                title = _clean_text(a.get_text(" ", strip=True))
+                results.append(SerpResult(title=title or clean, url=clean, snippet="", source_query=keywords))
+                if len(results) >= max_results:
+                    break
+
+            if not results:
+                pattern = r"https?://(?:[a-z0-9\-]+\.)?linkedin\.com/(?:in|company)/[^\s\"\'<>\)]+"
+                for raw in re.findall(pattern, html, flags=re.IGNORECASE):
+                    clean = raw.split("?")[0].split("#")[0]
+                    if kind == "people" and "linkedin.com/in/" not in clean:
+                        continue
+                    if kind != "people" and "linkedin.com/company/" not in clean:
+                        continue
+                    if clean in seen:
+                        continue
+                    seen.add(clean)
+                    results.append(SerpResult(title=clean, url=clean, snippet="", source_query=keywords))
+                    if len(results) >= max_results:
+                        break
+
+            return results, diagnostics
+
+        except requests.RequestException:
+            diagnostics["blocked"] = True
+            diagnostics["status"] = None
             continue
 
     return [], diagnostics
@@ -371,7 +404,7 @@ def main() -> None:
         kind = "companies" if strategy == "strategy_company_page" else "people"
 
         for q in queries:
-            res, diag = linkedin_search(q, kind=kind, max_results=args.max, timeout=args.timeout, debug=debug)
+            res, diag = bing_search(q, kind=kind, max_results=args.max, timeout=args.timeout, debug=debug)
             all_lists.append(res)
             diag_list.append(diag)
 
